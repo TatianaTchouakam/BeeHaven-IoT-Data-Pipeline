@@ -1,0 +1,126 @@
+import pandas as pd
+import requests
+import adlfs
+import os
+import fsspec
+
+# --- 1. CONFIGURATION ---
+# Replace these with your actual credentials or environment variables
+storage_account_name = "beehavenprojectdatalake"
+storage_account_key = "YOUR_SECRET_KEY" 
+container_name = "beehavendatalakecontainer"
+
+storage_options = {
+    'account_name': storage_account_name, 
+    'account_key': storage_account_key
+}
+
+# Path definitions
+root_dir = f'abfss://{container_name}@{storage_account_name}.dfs.core.windows.net/'
+processing_path = 'silver/processing/' 
+gold_processing = root_dir + 'gold/processing/'
+
+# File system initialization
+fs = adlfs.AzureBlobFileSystem(**storage_options)
+
+CITY_COORDS = {
+    "schwartau": {"lat": 53.92, "lon": 10.69},
+    "wurzburg":  {"lat": 49.79, "lon": 9.93} 
+}
+
+# --- 2. DATA CLEANING FUNCTIONS ---
+
+def double_save(df, category, place):
+    """Saves data to both Silver layer and Gold processing staging."""
+    filename = f"{place}_{category}.parquet"
+    path_silver = f"{root_dir}silver/{category}/{filename}"
+    path_gold = f"{gold_processing}{filename}"
+    
+    df.to_parquet(path_silver, storage_options=storage_options, index=False)
+    df.to_parquet(path_gold, storage_options=storage_options, index=False)
+    print(f"   ✅ {category.upper()} saved successfully.")
+
+def clean_flow(flow, place):
+    """Processes bee flow data by merging departures and arrivals."""
+    flow = flow.drop_duplicates().copy()
+    flow['timestamp'] = pd.to_datetime(flow['timestamp'])
+    
+    # Split dataset to isolate inbound and outbound traffic
+    departures = flow.iloc[:flow.shape[0]//2].copy()
+    arrivals = flow.iloc[flow.shape[0]//2:].copy()
+    
+    # Merge on timestamp with specific traffic suffixes
+    flow_cl = departures.merge(arrivals, on='timestamp', suffixes=('_out', '_in'))
+    double_save(flow_cl, "flow", place)
+
+def clean_temperature(df, place):
+    """Cleans hive temperature data and handles missing values."""
+    df = df.drop_duplicates().copy()
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    val_col = df.columns[1]
+    df[val_col] = df[val_col].fillna(df[val_col].mean())
+    double_save(df, "temperature", place)
+
+def clean_humidity(df, place):
+    """Normalizes hive humidity values."""
+    df = df.drop_duplicates().copy()
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    col_hum = [c for c in df.columns if 'hum' in c.lower()][0]
+    df[col_hum] = df[col_hum].abs()
+    double_save(df, "humidity", place)
+
+def clean_weight(df, place):
+    """Fixes negative hive weight values using mean positive values."""
+    df = df.drop_duplicates().copy()
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    val_col = [c for c in df.columns if 'weight' in c.lower()][0]
+    mean_pos = df[df[val_col] >= 0][val_col].mean()
+    df.loc[df[val_col] < 0, val_col] = mean_pos
+    double_save(df, "weight", place)
+
+def get_weather_data(df_ref, place):
+    """Fetches historical weather data via BrightSky API based on hive timestamps."""
+    coords = CITY_COORDS.get(place.lower(), CITY_COORDS["schwartau"])
+    start_dt = pd.to_datetime(df_ref['timestamp']).min()
+    end_dt = pd.to_datetime(df_ref['timestamp']).max()
+    
+    url = f"https://api.brightsky.dev/weather?lat={coords['lat']}&lon={coords['lon']}&date={start_dt.strftime('%Y-%m-%d')}&last_date={end_dt.strftime('%Y-%m-%d')}"
+    res = requests.get(url)
+    
+    if res.status_code == 200:
+        weather = pd.DataFrame(res.json()['weather'])
+        weather['timestamp'] = pd.to_datetime(weather['timestamp']).dt.tz_localize(None)
+        weather['city'] = place
+        double_save(weather, "weather", place)
+
+# --- 3. PIPELINE EXECUTION ---
+try:
+    print("🚀 Scanning Silver/Processing directory...")
+    all_files = fs.ls(f"{container_name}/{processing_path}")
+    csv_files = [f for f in all_files if f.endswith('.csv')]
+
+    for file_path in csv_files:
+        file_name = os.path.basename(file_path)
+        parts = file_name.replace(".csv", "").split("_")
+        sensor_type = parts[0]
+        city = parts[1]
+        
+        print(f"\n⚙️ Processing {file_name}...")
+        df = pd.read_csv(f"abfss://{file_path}", storage_options=storage_options)
+        df['city'] = city 
+
+        # Route to specific cleaning logic
+        if sensor_type == "flow": 
+            clean_flow(df, city)
+        elif sensor_type == "temperature": 
+            clean_temperature(df, city)
+            get_weather_data(df, city)
+        elif sensor_type == "humidity": 
+            clean_humidity(df, city)
+        elif sensor_type == "weight": 
+            clean_weight(df, city)
+
+    print("\n🏁 ALL LOCATIONS PROCESSED SUCCESSFULLY!")
+    
+except Exception as e:
+    print(f"❌ Error encountered: {e}")
