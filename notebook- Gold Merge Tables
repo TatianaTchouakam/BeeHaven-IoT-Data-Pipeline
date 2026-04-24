@@ -1,0 +1,107 @@
+import pandas as pd
+import adlfs
+
+# --- 1. CONFIGURATION ---
+# Azure Storage credentials
+storage_options = {
+    "account_name": "beehavenprojectdatalake",
+    "account_key": "YOUR_SECRET_KEY" # REMEMBER TO REMOVE THIS BEFORE PUSHING TO GITHUB
+}
+
+# Initialize Azure Blob File System
+fs = adlfs.AzureBlobFileSystem(**storage_options)
+container = "beehavendatalakecontainer"
+path_gold_proc = f"{container}/gold/processing/"
+path_gold_final = f"{container}/gold/"
+
+# --- 2. DATA LOADING FUNCTIONS ---
+
+def load_data_all_cities(category):
+    """
+    Loads and concatenates all Parquet files for a specific category across all cities.
+    """
+    files = fs.ls(path_gold_proc)
+    matches = [f for f in files if category in f and f.endswith('.parquet')]
+    
+    if not matches:
+        print(f"⚠️ No data found for category: {category}")
+        return pd.DataFrame()
+
+    list_df = []
+    for f in matches:
+        df = pd.read_parquet(f"abfss://{f}", storage_options=storage_options)
+        # Ensure city column exists based on filename if missing
+        if 'city' not in df.columns:
+            df['city'] = f.split('/')[-1].split('_')[0]
+        list_df.append(df)
+    
+    return pd.concat(list_df, ignore_index=True)
+
+# --- 3. MAIN INTEGRATION PROCESS ---
+
+try:
+    print("🚀 Starting Gold Layer Integration...")
+
+    # Loading datasets from Silver/Gold staging
+    df_flow = load_data_all_cities("flow")
+    df_temp_hive = load_data_all_cities("temperature")
+    df_weight = load_data_all_cities("weight")
+    df_weather = load_data_all_cities("weather")
+
+    # Standardize timestamps
+    for df in [df_flow, df_temp_hive, df_weight, df_weather]:
+        if not df.empty:
+            df['timestamp'] = pd.to_datetime(df['timestamp']).dt.tz_localize(None)
+
+    print("🔗 Merging datasets (Asynchronous Temporal Join)...")
+
+    # Step-by-step merge using Hive Flow as the primary reference
+    # 1. Add Hive Temperature
+    gold = pd.merge_asof(
+        df_flow.sort_values('timestamp'),
+        df_temp_hive.sort_values('timestamp'),
+        on='timestamp', by='city', direction='backward'
+    )
+
+    # 2. Add Hive Weight
+    gold = pd.merge_asof(
+        gold.sort_values('timestamp'),
+        df_weight.sort_values('timestamp'),
+        on='timestamp', by='city', direction='backward'
+    )
+
+    # 3. Add External Weather Data (The key correlation feature)
+    gold = pd.merge_asof(
+        gold.sort_values('timestamp'),
+        df_weather.sort_values('timestamp'),
+        on='timestamp', by='city', direction='backward'
+    )
+
+    # --- 4. DATA AGGREGATION (BONUS DAILY STATS) ---
+    print("📊 Calculating daily statistics for BI reporting...")
+    
+    gold['date_only'] = gold['timestamp'].dt.date
+    
+    daily_stats = gold.groupby(['city', 'date_only']).agg({
+        'flow_in': 'sum',
+        'flow_out': 'sum',
+        'temp_outside': 'mean',
+        'temp_hive': 'mean',
+        'weight_kg': 'mean'
+    }).reset_index()
+
+    # --- 5. EXPORTING TO GOLD DATA LAKE ---
+    timestamp_str = pd.Timestamp.now().strftime('%Y-%m-%d_%Hh%M')
+    
+    # Save the full merged table
+    file_full = f"gold_merged_data_{timestamp_str}.parquet"
+    gold.to_parquet(f"abfss://{path_gold_final}{file_full}", storage_options=storage_options, index=False)
+    
+    # Save the daily stats (Bonus file for Power BI)
+    file_bonus = f"bonus_daily_stats_ALL_{timestamp_str}.parquet"
+    daily_stats.to_parquet(f"abfss://{path_gold_final}{file_bonus}", storage_options=storage_options, index=False)
+
+    print(f"✅ Success! Gold files generated:\n - {file_full}\n - {file_bonus}")
+
+except Exception as e:
+    print(f"❌ Error during Gold processing: {e}")
